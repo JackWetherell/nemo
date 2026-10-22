@@ -348,7 +348,23 @@ agent: the agent is the untrusted party in this design.
 | Ollama auth proxy on `0.0.0.0:11435` | Likewise a process, started by NemoClaw on demand |
 | The loaded model | Unloads after `OLLAMA_KEEP_ALIVE` (5 min idle); reloads on first use, ~44 s cold |
 
-### The sequence
+### One command
+
+`~/scripts/start_queeg.sh` does all of the below, and refuses to guess when the
+sandbox is in `Error`:
+
+```bash
+queeg              # alias -> start_queeg.sh: host checks, start, warm model, open TUI
+queeg-status       # report only, change nothing
+queeg --dashboard  # print the authenticated browser URL instead of opening the TUI
+queeg --no-warm    # skip pre-loading the model
+```
+
+It needs no sudo: if `docker` or `ollama` is down it prints the command rather
+than prompting for a password. It also pre-loads the model with
+`keep_alive=30m`, so your first prompt isn't the ~44 s cold load.
+
+### The sequence, manually
 
 ```bash
 # 1. Log in to your desktop session (starts the user-scoped OpenShell gateway)
@@ -485,4 +501,12 @@ README.md       this document
 setup-host.sh   privileged host preparation (idempotent, --check supported)
 Modelfile       num_ctx + sampling for qwen38-27b-64k
 .gitignore      keeps weights, state and tokens out of git
+```
+
+Outside the repo:
+
+```
+~/scripts/start_queeg.sh   one-command startup (see "After a reboot")
+~/nemoclaw-queeg-backup/   pre-rebuild sandbox state - contains credentials,
+                           mode 0700, delete when no longer needed
 ```
