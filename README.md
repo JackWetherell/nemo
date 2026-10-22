@@ -342,6 +342,8 @@ Two consequences:
 | Sandbox has no GPU | Stale or missing CDI spec — regenerate (above) |
 | Model load times out | Cold load retries once with a 300 s budget; a stale runner needs `systemctl restart ollama` |
 | Context reported as 4096 | Ollama is serving `qwen3.8:27b`, not `qwen38-27b-64k` |
+| TUI shows `/131k` but Ollama serves 64000 | `models.providers.inference.models[0].contextWindow` in `openclaw.json` defaults to 131072. Silent truncation: the harness never compacts, llama.cpp drops the oldest tokens. Set it to 64000, `gateway restart`, **and relaunch the TUI** — the status bar is fixed at session start |
+| Heredoc inside `nemoclaw exec` mangled | Nested heredocs don't survive argument passing. Base64-encode the script: `echo $B64 \| base64 -d \| python3` |
 | VRAM spills to host RAM | Lower `num_ctx` to 32000, or drop to `Q4_K_S` |
 | Agent cannot reach a host | Working as designed. Widen the policy deliberately |
 | `ollama.service` fails: `mkdir /home/...: permission denied` | `ProtectHome=yes` hides `/home` from the unit. Use the bind mount above, not a `/home` path |
@@ -361,6 +363,7 @@ driver 610.57.04 / CUDA 13.3, Ollama 0.40.7, nvidia-container-toolkit 1.20.1.
 | Tool calling | `get_weather({"city":"Tokyo"})` — correct name and arguments |
 | Quantization | Q4_K_M, 27.3B params, 262144 native context |
 | Capabilities | completion, vision, tools, thinking |
+| Harness context accounting | `tokens 21k/64k` — matches the server window |
 
 ## Security, as measured
 
