@@ -121,8 +121,20 @@ newgrp docker                   # or re-login
 
 Installs `nvidia-container-toolkit` + `ollama-cuda`, adds you to `docker`,
 relocates Docker's data-root to `/home/docker`, generates the NVIDIA CDI spec,
-and writes the Ollama tuning override. It is idempotent, backs up every file it
-rewrites, and deletes nothing.
+bind-mounts the model store, and writes the Ollama tuning override. It is
+idempotent, backs up every file it rewrites, and deletes nothing.
+
+**Why the model store is bind-mounted.** Arch ships `ollama.service` with
+`ProtectHome=yes`, so systemd replaces `/home` with an empty tmpfs inside the
+service's mount namespace — pointing `OLLAMA_MODELS` at `/home/...` fails with
+`mkdir: permission denied` no matter how the directory is owned. Rather than
+weaken that hardening on a network-facing daemon, the weights stay on `/home`
+and are bind-mounted to `/var/lib/ollama/models`, which the unit can see
+(`ProtectSystem=full` leaves `/var` writable):
+
+```
+/home/ollama-models  /var/lib/ollama/models  none  bind  0 0   # /etc/fstab
+```
 
 Verify GPU-in-container works — this is the step most likely to be wrong:
 
@@ -250,6 +262,8 @@ Two consequences:
 | Context reported as 4096 | Ollama is serving `qwen3.8:27b`, not `qwen38-27b-64k` |
 | VRAM spills to host RAM | Lower `num_ctx` to 32000, or drop to `Q4_K_S` |
 | Agent cannot reach a host | Working as designed. Widen the policy deliberately |
+| `ollama.service` fails: `mkdir /home/...: permission denied` | `ProtectHome=yes` hides `/home` from the unit. Use the bind mount above, not a `/home` path |
+| `pacman -S` 404s on a package | Local db is stale, not the mirror. `sudo pacman -Syu` (a bare `-Sy` + `-S` is a partial upgrade) |
 
 ## Layout
 

@@ -132,6 +132,35 @@ else
   run install -d -m 0755 "$OLLAMA_MODELS"
 fi
 
+# Arch ships ollama.service with ProtectHome=yes, which replaces /home with an
+# empty tmpfs inside the service namespace - so OLLAMA_MODELS cannot point at
+# /home directly. Rather than weaken that hardening on a network-facing daemon,
+# bind-mount the big-disk directory to a path under /var/lib, which the unit can
+# see (ProtectSystem=full leaves /var writable).
+MODELS_MOUNT="/var/lib/ollama/models"
+if id "$ollama_user" &>/dev/null; then
+  run install -d -o "$ollama_user" -g "$ollama_user" -m 0755 "$MODELS_MOUNT"
+else
+  run install -d -m 0755 "$MODELS_MOUNT"
+fi
+
+fstab_line="$OLLAMA_MODELS $MODELS_MOUNT none bind 0 0"
+if grep -qsF "$MODELS_MOUNT" /etc/fstab; then
+  ok "fstab already has a bind entry for $MODELS_MOUNT"
+elif (( CHECK_ONLY )); then
+  printf '   would append to /etc/fstab: %s\n' "$fstab_line"
+else
+  cp -a /etc/fstab "/etc/fstab.bak.$(date +%s)"
+  printf '\n# NemoClaw: keep Ollama model weights on the large /home filesystem\n%s\n' "$fstab_line" >> /etc/fstab
+  ok "appended bind mount to /etc/fstab (backup kept)"
+fi
+run systemctl daemon-reload
+if ! mountpoint -q "$MODELS_MOUNT" 2>/dev/null; then
+  run mount "$MODELS_MOUNT"
+fi
+mountpoint -q "$MODELS_MOUNT" 2>/dev/null && ok "$OLLAMA_MODELS mounted at $MODELS_MOUNT" \
+  || { (( CHECK_ONLY )) || warn "bind mount not active at $MODELS_MOUNT"; }
+
 # OLLAMA_HOST is deliberately NOT set here: NemoClaw pins Ollama to
 # 127.0.0.1:11434 itself and fronts it with a token-gated proxy on 11435.
 # Setting it here would be overwritten or fight the installer.
@@ -142,14 +171,14 @@ if (( CHECK_ONLY )); then
 else
   cat > /etc/systemd/system/ollama.service.d/override.conf <<EOF
 [Service]
-Environment="OLLAMA_MODELS=$OLLAMA_MODELS"
+Environment="OLLAMA_MODELS=$MODELS_MOUNT"
 Environment="OLLAMA_FLASH_ATTENTION=1"
 Environment="OLLAMA_KV_CACHE_TYPE=q8_0"
 EOF
   ok "wrote ollama override.conf"
 fi
 run systemctl daemon-reload
-run systemctl enable --now ollama.service
+run systemctl restart ollama.service || run systemctl enable --now ollama.service
 
 # ------------------------------------------------------------- 6. report
 step "Result"
@@ -160,7 +189,7 @@ fi
 docker info -f 'Docker root: {{.DockerRootDir}}' 2>/dev/null || warn "docker not responding"
 systemctl is-active ollama.service >/dev/null && ok "ollama.service active" || warn "ollama.service not active"
 printf '\n'
-ok "Host prepared. Next, as %s (not root):\n" "$TARGET_USER"
+ok "Host prepared. Next, as $TARGET_USER (not root):"
 cat <<EOF
    newgrp docker                 # or re-login, to pick up group membership
    docker run --rm --device nvidia.com/gpu=all \\
