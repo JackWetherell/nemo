@@ -91,16 +91,23 @@ So 64k context needs **4.0 GiB** — not the ~16 GiB a conventional dense 27B
 would need (all 64 layers caching → 256 KiB/token). `OLLAMA_KV_CACHE_TYPE=q8_0`
 halves it again to ~2.0 GiB, at a measured perplexity cost of 0.002–0.05.
 
+Measured on this machine (`nvidia-smi` with the model resident, not estimated):
+
 | Item | Size |
 |---|---|
-| Q4_K_M weights | ~16.5 GB |
-| q8_0 KV cache @ 64k | ~2.0 GB |
-| CUDA context + compute buffers | ~0.8 GB |
-| Desktop (Xorg + kwin_x11) | ~1.2 GB |
-| **Total** | **~20.5 GB of 24.5 GB** |
+| Q4_K_M weights | ~16.0 GiB |
+| CLIP vision projector (460.7M params) | ~0.9 GiB |
+| q8_0 KV cache @ 64k | ~2.0 GiB |
+| Compute buffers + CUDA context | ~1.2 GiB |
+| Desktop (Xorg + kwin_x11) | ~1.2 GiB |
+| **Total** | **21786 MiB of 24564 MiB** |
 
-That ~4 GB of headroom is deliberate: Qwen3.8-27B is multimodal, and image or
-video input consumes both context and activation memory.
+`ollama ps` reports **100% GPU** — nothing spills to host RAM, which is what
+would otherwise destroy throughput.
+
+That leaves **~2.7 GiB headroom**, and it is not spare: Qwen3.8-27B is
+multimodal, so image or video input draws on it. If you feed it large images and
+see a spill, drop `num_ctx` to 48000 to buy back ~0.5 GiB.
 
 **The architecture is load-bearing.** A same-size full-attention model could not
 hold a 64k agent context on this card at all.
@@ -174,12 +181,17 @@ NEMOCLAW_PROVIDER=ollama \
 NEMOCLAW_MODEL=qwen38-27b-64k \
 NEMOCLAW_POLICY_MODE=suggested \
 NEMOCLAW_WEB_SEARCH_PROVIDER=none \
-NEMOCLAW_SANDBOX_NAME=my-assistant \
+NEMOCLAW_SANDBOX_NAME=queeg \
 bash /tmp/nemoclaw.sh
 ```
 
 Run it **in a real terminal** — the installer needs a TTY to authenticate `sudo`
 (it probes `sudo -n`, then falls back to `sudo -v` via `/dev/tty`).
+
+Note that `NEMOCLAW_SANDBOX_NAME` is honoured only in non-interactive mode; the
+interactive wizard generates its own name, so set it at the "Edit sandbox name"
+prompt instead. The name is just an identifier for the `nemoclaw <name> …` and
+`openshell forward … <name>` commands.
 
 Telemetry is on by default; `NEMOCLAW_DISABLE_TELEMETRY=1` opts out.
 
@@ -207,26 +219,37 @@ openclaw agent --agent main --local \
   -m "summarise ~/notes.md" --session-id work      # one-shot, scriptable
 
 nemoclaw list                                     # all sandboxes
-nemoclaw my-assistant status                      # health
-nemoclaw my-assistant connect                     # shell inside the sandbox
-nemoclaw my-assistant logs --follow               # live logs
+nemoclaw queeg status                      # health
+nemoclaw queeg connect                     # shell inside the sandbox
+nemoclaw queeg logs --follow               # live logs
 
-openshell forward start 18789 my-assistant --background
+openshell forward start 18789 queeg --background
 # → http://127.0.0.1:18789  (token auth)
 ```
 
 ### Thinking mode
 
-Thinking is **on by default** and improves tool selection, at a latency cost.
-Sampling differs between modes, per the model card:
+Thinking is **graded, not boolean**. `ollama show` reports levels
+`false, low, medium, xhigh`, defaulting to **`medium`** — so the agent reasons
+before acting unless told otherwise. Higher levels improve tool selection at a
+latency cost. Set it per request:
+
+```bash
+curl -s http://127.0.0.1:11434/api/chat -d '{
+  "model":"qwen38-27b-64k", "think":"low",
+  "messages":[{"role":"user","content":"..."}]}'
+```
+
+`"think":false` disables it entirely. Sampling should match the mode, per the
+model card:
 
 | Mode | Settings |
 |---|---|
 | Thinking | `temperature=1.0, top_p=0.95, top_k=20, min_p=0.0` |
 | Non-thinking | `temperature=0.7, top_p=0.80, top_k=20, presence_penalty=1.5` |
 
-The `Modelfile` pins the non-thinking values. Override per-request, or send
-`"enable_thinking": false` to disable thinking entirely.
+The `Modelfile` pins the non-thinking values, so raise `temperature` to 1.0 when
+running with thinking on.
 
 ### Adding a messaging channel
 
@@ -264,6 +287,21 @@ Two consequences:
 | Agent cannot reach a host | Working as designed. Widen the policy deliberately |
 | `ollama.service` fails: `mkdir /home/...: permission denied` | `ProtectHome=yes` hides `/home` from the unit. Use the bind mount above, not a `/home` path |
 | `pacman -S` 404s on a package | Local db is stale, not the mirror. `sudo pacman -Syu` (a bare `-Sy` + `-S` is a partial upgrade) |
+
+## Verified on this machine
+
+Measured, not assumed — Arch Linux, kernel 7.2.3-arch1-2, RTX 4090 24 GB,
+driver 610.57.04 / CUDA 13.3, Ollama 0.40.7, nvidia-container-toolkit 1.20.1.
+
+| Check | Result |
+|---|---|
+| GPU in container via CDI | `RTX 4090, 610.57.04, 24564 MiB` from a bare `nvidia/cuda` image |
+| Model resident | 21786 MiB / 24564 MiB, **100% GPU**, context 64000 |
+| Cold load | 44 s |
+| Generation throughput | **65.7 tok/s** (175 tokens) |
+| Tool calling | `get_weather({"city":"Tokyo"})` — correct name and arguments |
+| Quantization | Q4_K_M, 27.3B params, 262144 native context |
+| Capabilities | completion, vision, tools, thinking |
 
 ## Layout
 
