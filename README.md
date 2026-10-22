@@ -294,6 +294,38 @@ second way in. Note also that `rebuild` resets `gateway.auth` to a fresh
 plaintext token and empties the store, so this hardening is not durable across
 rebuilds.
 
+### Model lifecycle and VRAM
+
+The model is **loaded on demand, not held permanently**. Ollama loads it on the
+first request and unloads it after `OLLAMA_KEEP_ALIVE` of inactivity (unset here,
+so the default **5 minutes**). The sandbox, gateway and agent stay `Ready`
+throughout — only GPU memory is released.
+
+| State | VRAM used |
+|---|---|
+| Idle (model unloaded) | ~1.1 GB — desktop + driver only |
+| Model resident | ~21.9 GB of 24.5 GB |
+
+So an empty `ollama ps` and ~1 GB of VRAM is normal, not a fault. The cost is a
+~44 s cold load on the next prompt; `start_queeg.sh` pre-loads to avoid that.
+
+`keep_alive` is per-request and the most recent value wins. The pre-warm asks
+for 30 m, but OpenClaw's own turns don't specify one, so after each agent reply
+the timer reverts to the 5 m default. Net effect: resident while you're working,
+released ~5 minutes after you stop.
+
+Deliberately left on-demand, because 21.9 GB is most of the card and this
+machine also runs Isaac Sim, Unreal and training jobs. To change it:
+
+```bash
+ollama stop qwen38-27b-64k        # release the GPU right now
+
+# or make it permanent (needs sudo + daemon-reload + restart):
+#   /etc/systemd/system/ollama.service.d/override.conf
+#   Environment="OLLAMA_KEEP_ALIVE=30m"   # longer idle window
+#   Environment="OLLAMA_KEEP_ALIVE=-1"    # never unload; holds 21.9 GB forever
+```
+
 ### Thinking mode
 
 Thinking is **graded, not boolean**. `ollama show` reports levels
@@ -412,6 +444,43 @@ restart policy is `no`.
 
 > Verified from service-enablement state, fstab, the container's restart policy
 > and `Linger=no` — not from an actual reboot. Confirm on your first one.
+
+## Where things physically live
+
+Everything persistent is on `/home` (836 GB), nothing on the nearly-full root
+partition. The agent's state is a **named Docker volume**, not part of the
+container's throwaway layer — which is why `rebuild` preserves it.
+
+| What | Host path |
+|---|---|
+| **Agent workspace + all OpenClaw state** | `/home/docker/volumes/nemoclaw-openclaw-state-v1-queeg/_data` → `/sandbox/.openclaw` |
+| ↳ workspace (`AGENTS.md`, `IDENTITY.md`, `POLICY.md`, `SOUL.md`, `USER.md`) | `…/_data/workspace` (~36 KB) |
+| ↳ `openclaw.json`, credentials, memory, secret store | `…/_data/` |
+| Container writable layer (ephemeral) | `/home/docker/overlay2/<id>/diff` |
+| Model weights (~17 GB) | `/home/ollama-models` → `/var/lib/ollama/models` |
+| Gateway TLS material | `~/.local/state/nemoclaw/openshell-docker-gateway/tls/` |
+| Sandbox identity JWT | `~/.local/state/openshell/docker-sandbox-tokens/…/sandbox.jwt` |
+| NemoClaw host state, Ollama proxy token | `~/.nemoclaw/` |
+
+`/home/docker` is root-owned, so you cannot browse the volume directly as your
+own user. Use the supported routes instead:
+
+```bash
+nemoclaw queeg share mount          # mount the sandbox filesystem on the host
+nemoclaw queeg share unmount
+nemoclaw queeg download /sandbox/.openclaw/workspace/AGENTS.md
+nemoclaw queeg upload ./notes.md
+nemoclaw queeg connect              # or just shell in
+```
+
+Two things follow from this layout:
+
+- **To back up the agent, back up that volume** (or
+  `nemoclaw config export queeg`). The repo holds configuration, not state.
+- **The bind-mounted TLS certs are why `~/.local/state` permissions matter.**
+  OpenShell validates the whole ancestor chain of its state directory and
+  refuses group- or world-write — which is exactly what took the sandbox down
+  mid-session once already.
 
 ## Arch Linux notes
 
