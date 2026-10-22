@@ -286,6 +286,14 @@ nemoclaw queeg exec -- sh -c 'printf %s "$VALUE" | \
 
 Store ids must match `/^[A-Z][A-Z0-9_]{0,127}$/`.
 
+**Order matters.** Migrating `gateway.auth.token` to a secret-kind store entry
+makes it **write-only**, so `nemoclaw <name> gateway-token` stops working and you
+can no longer paste the token into the dashboard's login form. Pair every client
+you want (browser, TUI) *before* hardening — or set `gateway.auth.password` as a
+second way in. Note also that `rebuild` resets `gateway.auth` to a fresh
+plaintext token and empties the store, so this hardening is not durable across
+rebuilds.
+
 ### Thinking mode
 
 Thinking is **graded, not boolean**. `ollama show` reports levels
@@ -320,6 +328,75 @@ agent: the agent is the untrusted party in this design.
 
 ---
 
+## After a reboot
+
+### What comes back on its own
+
+| Component | Mechanism |
+|---|---|
+| Docker (data-root `/home/docker`) | `docker.service` is **enabled** |
+| Ollama + tuning (`q8_0` KV, flash attn, model path) | `ollama.service` is **enabled** |
+| Model store bind mount | `/etc/fstab`: `/home/ollama-models → /var/lib/ollama/models` |
+| OpenShell gateway | `~/.config/systemd/user/nemoclaw-openshell-gateway.service`, **enabled** — but it is a *user* unit with `Linger=no`, so it starts when you **log in**, not at boot |
+
+### What does not
+
+| Component | Why |
+|---|---|
+| The sandbox container | Its Docker restart policy is `no`, by OpenShell's design |
+| Host forward on `127.0.0.1:18789` | A plain process, not a service |
+| Ollama auth proxy on `0.0.0.0:11435` | Likewise a process, started by NemoClaw on demand |
+| The loaded model | Unloads after `OLLAMA_KEEP_ALIVE` (5 min idle); reloads on first use, ~44 s cold |
+
+### The sequence
+
+```bash
+# 1. Log in to your desktop session (starts the user-scoped OpenShell gateway)
+
+# 2. Sanity check the host layer
+systemctl is-active docker ollama          # expect: active active
+findmnt /var/lib/ollama/models             # expect the bind mount
+systemctl --user is-active nemoclaw-openshell-gateway
+
+# 3. Bring the sandbox back
+nemoclaw queeg start
+nemoclaw queeg status                      # expect Phase: Ready, Inference: healthy
+
+# 4. Use it
+nemoclaw launch queeg                      # TUI
+nemoclaw queeg dashboard-url --quiet       # or the browser (new tab)
+```
+
+If `status` does not reach `Ready`, in escalating order:
+
+```bash
+nemoclaw queeg recover        # repairs a stopped gateway and host forwards
+nemoclaw queeg doctor         # diagnose; --fix to apply
+nemoclaw queeg rebuild --yes  # last resort: recreates the workload
+```
+
+`rebuild` is the **only** way out of `Phase: Error` (since `start` requires
+`Stopped` and `stop` requires `Ready`), but note it resets `gateway.auth` to a
+fresh plaintext token and empties the secret store.
+
+The first prompt after a reboot takes ~44 s while the 17 GB model loads; `ollama
+ps` should then show `100% GPU` and `CONTEXT 64000`.
+
+### Optional: start without logging in
+
+Because the gateway is a user unit with `Linger=no`, an "always-on" assistant
+currently requires a desktop login. To have it start at boot instead:
+
+```bash
+sudo loginctl enable-linger jack
+```
+
+You would still need `nemoclaw queeg start` for the sandbox itself, since its
+restart policy is `no`.
+
+> Verified from service-enablement state, fstab, the container's restart policy
+> and `Linger=no` — not from an actual reboot. Confirm on your first one.
+
 ## Arch Linux notes
 
 Arch is **not a validated distro** — NemoClaw validates Ubuntu 24.04 primarily.
@@ -343,6 +420,9 @@ Two consequences:
 | Model load times out | Cold load retries once with a 300 s budget; a stale runner needs `systemctl restart ollama` |
 | Context reported as 4096 | Ollama is serving `qwen3.8:27b`, not `qwen38-27b-64k` |
 | TUI shows `/131k` but Ollama serves 64000 | `models.providers.inference.models[0].contextWindow` in `openclaw.json` defaults to 131072. Silent truncation: the harness never compacts, llama.cpp drops the oldest tokens. Set it to 64000, `gateway restart`, **and relaunch the TUI** — the status bar is fixed at session start |
+| `Unsafe OpenShell gateway state directory ... ancestor '~/.local/state'` | OpenShell rejects **group OR world** write on every ancestor of its state dir. `chmod o-w` is not enough — use `chmod go-w` |
+| `Phase: Error` and both start/stop refused | Terminal state: `start` needs `Stopped`, `stop` needs `Ready`. Escape with `nemoclaw <name> rebuild --yes` — it recreates the workload and preserves `openclaw.json`, but **resets `gateway.auth` and empties the secret store** |
+| `gateway restart` → `transport failed (malformed)` | The in-sandbox gateway died and the container exited. Read the real reason from Docker: `docker logs $(docker ps -aq --filter name=<sandbox>)` |
 | Heredoc inside `nemoclaw exec` mangled | Nested heredocs don't survive argument passing. Base64-encode the script: `echo $B64 \| base64 -d \| python3` |
 | VRAM spills to host RAM | Lower `num_ctx` to 32000, or drop to `Q4_K_S` |
 | Agent cannot reach a host | Working as designed. Widen the policy deliberately |
