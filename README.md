@@ -171,10 +171,14 @@ less /tmp/nemoclaw.sh
 ```
 
 It is a thin bootstrap: it clones `NVIDIA/NemoClaw` at a ref and executes
-`scripts/install.sh` from that clone. Pin the ref for reproducibility:
+`scripts/install.sh` from that clone. Pin the ref for reproducibility — but pin
+the **release tag, not a commit SHA**. Sandbox workload preparation compares the
+install ref against the installed build identity (`v0.0.137`), and a bare SHA
+fails that check with *"the exact install ref does not match the installed build
+identity"* even when it names the very same commit:
 
 ```bash
-NEMOCLAW_INSTALL_REF=8e63c869ae1fe5f5044a102b9cfcdde29b18fd9a \
+NEMOCLAW_INSTALL_REF=v0.0.137 \
 NEMOCLAW_DISABLE_TELEMETRY=1 \
 NEMOCLAW_AGENT=openclaw \
 NEMOCLAW_PROVIDER=ollama \
@@ -213,19 +217,74 @@ nemoclaw inference get
 
 ## Usage
 
+`openclaw` itself is **not installed on the host** — it exists only inside the
+sandbox. You drive everything through `nemoclaw`.
+
+### Talk to it
+
 ```bash
-openclaw tui                                      # interactive TUI
-openclaw agent --agent main --local \
-  -m "summarise ~/notes.md" --session-id work      # one-shot, scriptable
+nemoclaw launch queeg                    # interactive TUI (the main way in)
+nemoclaw queeg dashboard-url --quiet     # authenticated browser URL (token embedded)
 
-nemoclaw list                                     # all sandboxes
-nemoclaw queeg status                      # health
-nemoclaw queeg connect                     # shell inside the sandbox
-nemoclaw queeg logs --follow               # live logs
-
-openshell forward start 18789 queeg --background
-# → http://127.0.0.1:18789  (token auth)
+# one-shot, scriptable
+nemoclaw queeg agent --agent main --message "summarise the file I uploaded"
 ```
+
+Open the dashboard URL in a **new tab**. Editing the `#token=` fragment of an
+already-open tab does not reload the page, so the UI never reads the token and
+hangs on the WebSocket.
+
+### Lifecycle
+
+```bash
+nemoclaw list                            # all sandboxes
+nemoclaw queeg status                    # health, route, GPU, policy
+nemoclaw queeg doctor                    # deep diagnosis (add --fix to apply)
+nemoclaw queeg logs --follow             # live logs, incl. OCSF audit events
+nemoclaw queeg stop | start              # preserves workspace state
+nemoclaw queeg gateway restart           # after config changes
+nemoclaw queeg rebuild                   # upgrade to current agent version
+```
+
+### Getting data in and out
+
+The sandbox cannot see your home directory, so files must be handed over
+explicitly:
+
+```bash
+nemoclaw queeg upload ./report.csv       # host -> sandbox
+nemoclaw queeg download /sandbox/out.md  # sandbox -> host
+nemoclaw queeg exec -- ls -la /sandbox   # run a command inside
+nemoclaw queeg connect                   # interactive shell inside
+```
+
+### Inference
+
+```bash
+nemoclaw inference get
+nemoclaw inference set --model <model> --provider <provider> --sandbox queeg
+ollama ps                                # is the model resident? 100% GPU?
+ollama stop qwen38-27b-64k               # free 21.8 GB of VRAM on demand
+```
+
+### Secrets
+
+```bash
+nemoclaw queeg exec -- openclaw secrets audit --check      # expect plaintext=0
+nemoclaw queeg exec --tty -- openclaw secrets configure    # map config -> SecretRef
+nemoclaw queeg exec -- openclaw secrets reload             # apply without restart
+```
+
+Seed the store *before* mapping a ref, or `configure` fails with
+`Secret store entry "X" was not found`. Secret-kind values must come from
+`--value-file -` (stdin), never `--value`, which keeps them out of `argv`:
+
+```bash
+nemoclaw queeg exec -- sh -c 'printf %s "$VALUE" | \
+  openclaw secrets store set MY_TOKEN --kind secret --value-file -'
+```
+
+Store ids must match `/^[A-Z][A-Z0-9_]{0,127}$/`.
 
 ### Thinking mode
 
@@ -302,6 +361,39 @@ driver 610.57.04 / CUDA 13.3, Ollama 0.40.7, nvidia-container-toolkit 1.20.1.
 | Tool calling | `get_weather({"city":"Tokyo"})` — correct name and arguments |
 | Quantization | Q4_K_M, 27.3B params, 262144 native context |
 | Capabilities | completion, vision, tools, thinking |
+
+## Security, as measured
+
+These are probe results from inside the running sandbox, not claims from docs.
+
+| Probe | Result |
+|---|---|
+| Identity | `uid=998(sandbox)`, `CapPrm/CapEff/CapBnd = 0000000000000000` — zero capabilities |
+| Host home readable? | `/home/jack`, `.ssh`, `.claude`, `projects` all **absent** from the namespace |
+| `/etc/shadow` | `Permission denied` |
+| Public internet | `example.com`, `raw.githubusercontent.com`, `api.telegram.org` → `HTTP 000` |
+| Raw IP (DNS bypass) | `https://1.1.1.1` → denied |
+| `inference.local` from a shell | `{"error":"policy_denied"}` — even `POST /v1/chat/completions` |
+| `inference.local` from the agent | **works** |
+| Landlock | `ABI V2`, `rules_applied:19`, ro:7 rw:13 (from OCSF audit log) |
+
+The last two rows are the important pair. The *same* endpoint, method and path
+is denied to `curl` and permitted to the agent, because the sandbox **identifies
+the calling program** before relaying to the supervisor. The boundary is
+per-program, not merely per-host.
+
+Your home directory is not merely access-controlled — it is **not in the
+sandbox's mount namespace at all**. The only host paths bind-mounted in are
+read-only NVIDIA driver libraries.
+
+Two residual risks worth knowing:
+
+- `openclaw.json` inside the sandbox holds credentials the agent can read unless
+  migrated to SecretRefs (`openclaw secrets audit --check`). The agent is the
+  untrusted party in this design, so this one matters.
+- `memory.search` defaults to the **OpenAI** provider. Inert without a key, but
+  on a local-only build set `memory.search.enabled false` so conversation
+  content can never leave the machine.
 
 ## Layout
 
