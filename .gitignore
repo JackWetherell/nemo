@@ -1,0 +1,21 @@
+# Model weights and Ollama state - never commit (~17 GB)
+*.gguf
+*.safetensors
+models/
+
+# Sandbox, gateway and agent state
+.nemoclaw/
+.openshell/
+.openclaw/
+sandbox-state/
+
+# Secrets: proxy tokens, bot tokens, API keys
+*token*
+*.key
+*.pem
+.env
+.env.*
+
+# Logs and scratch
+*.log
+logs/

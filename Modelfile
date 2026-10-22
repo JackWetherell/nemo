@@ -1,0 +1,22 @@
+# Qwen3.8-27B tuned for a 24 GB RTX 4090 under NemoClaw.
+#   ollama create qwen38-27b-64k -f Modelfile
+FROM qwen3.8:27b
+
+# The single biggest VRAM lever: Ollama allocates the KV cache for the full
+# num_ctx up front, whether or not it gets used (default is only 4096).
+#
+# 64k is affordable here because Qwen3.8-27B is hybrid-attention. Its 64 layers
+# are 16 x (3 x Gated DeltaNet -> 1 x Gated Attention), so only 16 layers carry
+# a growing KV cache; the other 48 hold constant-size recurrent state. At
+# 4 KV heads x 256 head_dim that is 2*4*256*16 = 32768 elem/token = 64 KiB/token
+# at BF16, so 64k costs 4.0 GiB -- halved to ~2.0 GiB by OLLAMA_KV_CACHE_TYPE=q8_0
+# (set in the systemd override). A conventional dense 27B would need ~16 GiB.
+PARAMETER num_ctx 64000
+
+# Non-thinking sampling, per the Qwen3.8 model card. Thinking mode (on by
+# default) wants temperature 1.0 / top_p 0.95 / top_k 20 / min_p 0.0 instead;
+# override per-request rather than editing these.
+PARAMETER temperature 0.7
+PARAMETER top_p 0.80
+PARAMETER top_k 20
+PARAMETER presence_penalty 1.5
