@@ -220,6 +220,34 @@ nemoclaw inference get
 `openclaw` itself is **not installed on the host** — it exists only inside the
 sandbox. You drive everything through `nemoclaw`.
 
+### Shell shortcuts (`~/.bashrc`)
+
+| Command | Kind | What it does |
+|---|---|---|
+| `ncl` | alias | `nemoclaw launch queeg`: TUI, and (re)starts the Ollama auth proxy |
+| `ncl_mount` / `ncl_umount` | alias | SSHFS-mount the workspace at `~/queeg` (see [Shared workspace](#shared-workspace-queeg)) |
+| `ncl_sh [-u 0]` | function | `docker exec` shell in the container as `sandbox` (or root) |
+| `ncl_stop` | function | Emergency stop: kill auth proxy → stop sandbox → unload model → unmount `~/queeg` |
+| `ncl_list` | function | List all `ncl*` commands |
+
+`ncl_sh` lands in the container's network namespace, **not** the agent's nested
+one, so network tests from it (and `openclaw doctor`'s gateway check) do not
+reflect what the agent sees. To test the agent's real egress path:
+
+```bash
+C=$(docker ps -q --filter name=openshell-default--queeg-)
+GP=$(docker exec $C pgrep -f openclaw-gateway | head -1)
+docker exec -u 0 $C nsenter -t $GP -n -- env HTTPS_PROXY=http://10.200.0.1:3128 \
+  curl -s -o /dev/null -w '%{http_code}\n' --cacert /etc/openshell-tls/ca-bundle.pem https://pypi.org/simple/
+```
+
+The `--cacert` matters: L7-inspected presets (e.g. `pypi`) re-sign TLS with the
+OpenShell CA, so without it curl reports `000` even when the request is allowed.
+
+`ps -eo pid,ppid,user,etime,cmd --forest` inside the container shows the tree:
+`openshell-sandbox` (PID 1, supervisor) → `nemoclaw-start` → `openclaw-gateway`
+(the agent; tool calls appear as its children), plus `openclaw tui` per session.
+
 ### Talk to it
 
 ```bash
@@ -257,6 +285,53 @@ nemoclaw queeg download /sandbox/out.md  # sandbox -> host
 nemoclaw queeg exec -- ls -la /sandbox   # run a command inside
 nemoclaw queeg connect                   # interactive shell inside
 ```
+
+### Shared workspace (`~/queeg`)
+
+```bash
+sudo pacman -S sshfs     # once
+ncl_mount                # nemoclaw queeg share mount /sandbox/.openclaw/workspace ~/queeg
+ncl_umount
+```
+
+SSHFS logs in as `sandbox`, so files show as uid 998 but you can read and write
+them, and files you create are owned correctly for the agent. The sandbox must
+be running. This is one-way visibility: you see the agent's files; it still
+cannot see yours. If unmount says *Device or resource busy*, a shell is `cd`'d
+into it — `cd ~`, or `fusermount3 -uz ~/queeg`.
+
+Workspace layout (`/sandbox/.openclaw/workspace`):
+
+| Path | Loaded into every prompt? | Role |
+|---|---|---|
+| `AGENTS.md` | yes | Operating rules (also the only file sub-agents get) |
+| `SOUL.md`, `IDENTITY.md` | yes | Persona, name |
+| `USER.md` | yes, **capped at 4,000 chars** | Model of you; the excess is silently dropped |
+| `MEMORY.md` | yes (main session only) | Curated long-term memory; dreaming promotes into it |
+| `memory/YYYY-MM-DD.md` | no — via `memory_search`/`memory_get` (and once after `/new`) | Daily logs |
+| `memory/.dreams/`, `memory/dreaming/`, `DREAMS.md` | no | Dreaming (memory consolidation) state, reports, diary |
+| `POLICY.md` | no | Snapshot written by `nemoclaw … policy explain`; goes stale on preset changes |
+| `notes/` | no | Agent's own files |
+
+Limits: 20,000 chars per bootstrap file, 60,000 total. `/context detail` in the
+TUI shows what is actually injected.
+
+### Git workflow
+
+The `github` preset allows only `/usr/bin/git` to `github.com`/`api.github.com:443`
+(`access: full`, so no credential injection; `gh` is not in the image; no SSH).
+NemoClaw has no GitHub provider for in-sandbox credentials. Current choice:
+**the agent commits locally, you push from the host.** This is stated in
+`AGENTS.md` so the agent doesn't try to push and then route around the failure.
+On the host, mark the SSHFS repos as safe (they are owned by uid 998):
+
+```bash
+git config --global --add safe.directory '/home/jack/queeg/*'   # git >= 2.46
+```
+
+If autonomous push is ever wanted: a fine-grained PAT scoped to specific repos,
+stored via git's credential helper on the volume (not an env var). The agent can
+read it — accept that knowingly.
 
 ### Inference
 
@@ -369,21 +444,37 @@ agent: the agent is the untrusted party in this design.
 | Docker (data-root `/home/docker`) | `docker.service` is **enabled** |
 | Ollama + tuning (`q8_0` KV, flash attn, model path) | `ollama.service` is **enabled** |
 | Model store bind mount | `/etc/fstab`: `/home/ollama-models → /var/lib/ollama/models` |
-| OpenShell gateway | `~/.config/systemd/user/nemoclaw-openshell-gateway.service`, **enabled** — but it is a *user* unit with `Linger=no`, so it starts when you **log in**, not at boot |
+| OpenShell gateway | `~/.config/systemd/user/nemoclaw-openshell-gateway.service`, **enabled**; `Linger=yes` (set 2026-10-25), so it starts at **boot**, no login needed |
+| DNS wait before the gateway | Drop-in `…/nemoclaw-openshell-gateway.service.d/wait-dns.conf`: waits ≤3 min for `getent hosts github.com` (see below) |
+| The sandbox container | Restart policy is `no`, but the gateway runs a **start sweep** on startup (`Started sandbox during gateway startup … started=1`) |
+| Agent inside the sandbox | `nemoclaw-start` → `openclaw-gateway`, with heartbeat and dreaming jobs |
+
+**Why the DNS wait exists.** Docker's embedded DNS (`127.0.0.11` in the
+container) snapshots upstream nameservers when a container *starts* and never
+refreshes them. On this machine Docker is up at ~70 s, Wi-Fi/DHCP at ~137 s, so
+without the wait the sandbox started with *no* upstream DNS (`dockerd: DNS
+resolver has no external nameservers`) and every egress failed until restarted.
 
 ### What does not
 
 | Component | Why |
 |---|---|
-| The sandbox container | Its Docker restart policy is `no`, by OpenShell's design |
-| Host forward on `127.0.0.1:18789` | A plain process, not a service |
-| Ollama auth proxy on `0.0.0.0:11435` | Likewise a process, started by NemoClaw on demand |
+| Ollama auth proxy on `0.0.0.0:11435` | A detached process started only by interactive `nemoclaw launch`/`connect` (`src/lib/actions/sandbox/connect.ts:2474`). **Until you run `ncl`, the agent is up but every model call fails** |
+| Host forward on `127.0.0.1:18789` | A plain process, restored by `start`/`launch` |
 | The loaded model | Unloads after `OLLAMA_KEEP_ALIVE` (5 min idle); reloads on first use, ~44 s cold |
+
+`~/.config/systemd/user/nemoclaw-queeg-up.service` (enabled) was meant to start
+the proxy at boot via `nemoclaw queeg connect --probe-only`. **It does not
+work:** tested 2026-10-25 with the proxy killed, `--probe-only` and
+`nemoclaw queeg start` both fail the inference probe and exit 1 without starting
+the proxy. So after a reboot, run `ncl` once. Open item: disable that unit, or
+find a non-interactive path that calls `ensureOllamaAuthProxy()`.
 
 ### One command
 
 `~/scripts/start_queeg.sh` does all of the below, and refuses to guess when the
-sandbox is in `Error`:
+sandbox is in `Error`. (The `queeg`/`queeg-status` aliases below are **not** in
+`~/.bashrc` as of 2026-10-25; call the script directly or use `ncl`.)
 
 ```bash
 queeg              # alias -> start_queeg.sh: host checks, start, warm model, open TUI
@@ -430,20 +521,26 @@ fresh plaintext token and empties the secret store.
 The first prompt after a reboot takes ~44 s while the 17 GB model loads; `ollama
 ps` should then show `100% GPU` and `CONTEXT 64000`.
 
-### Optional: start without logging in
-
-Because the gateway is a user unit with `Linger=no`, an "always-on" assistant
-currently requires a desktop login. To have it start at boot instead:
+### Autostart on/off
 
 ```bash
-sudo loginctl enable-linger jack
+systemctl --user disable --now nemoclaw-openshell-gateway   # nothing at boot
+sudo loginctl disable-linger jack                           # back to start-at-login
 ```
 
-You would still need `nemoclaw queeg start` for the sandbox itself, since its
-restart policy is `no`.
+> The boot sequence above is inferred from unit state, the gateway's own journal
+> (start sweep) and dockerd's DNS warning — the DNS drop-in has **not** yet been
+> through a real reboot. Check on the next one: `journalctl -b --user -u
+> nemoclaw-openshell-gateway` should show the start sweep *after* the DHCP lease
+> in `journalctl -b -u dhcpcd`.
 
-> Verified from service-enablement state, fstab, the container's restart policy
-> and `Linger=no` — not from an actual reboot. Confirm on your first one.
+### Boot-time clock
+
+The RTC held local time at boot (kernel set the clock to 20:35 UTC when it was
+20:35 PDT); `timesyncd` corrected it ~2.5 min later. Effects: Docker reports
+"Up 7 hours" on a fresh boot, the gateway logs a 7 h "process frozen", and early
+journal timestamps are wrong. Likely Windows dual-boot writing local time — fix
+there with `RealTimeIsUniversal`.
 
 ## Where things physically live
 
@@ -512,6 +609,11 @@ Two consequences:
 | VRAM spills to host RAM | Lower `num_ctx` to 32000, or drop to `Q4_K_S` |
 | Agent cannot reach a host | Working as designed. Widen the policy deliberately |
 | `ollama.service` fails: `mkdir /home/...: permission denied` | `ProtectHome=yes` hides `/home` from the unit. Use the bind mount above, not a `/home` path |
+| Agent: `LLM request failed: network connection error`, but `status`/`doctor` say inference healthy | Check `nemoclaw queeg logs --tail 300 \| grep -i credential`. **`POST request body credential traffic denied`** = the session transcript contains an `openshell:resolve:…` placeholder (e.g. the agent once ran `env`), and every request resends it. OpenShell rewrites placeholders only in headers, so it denies the body. Fix: `/new` in the TUI. Don't have the agent dump its environment |
+| Same error, `doctor` says auth proxy unreachable on `:11435` | Proxy not started since boot. Run `ncl` |
+| All egress `CONNECT tunnel failed, response 403`, even active presets | Read the OCSF reason, not the agent's guess. `DNS resolution failed … Try again` = boot DNS race above; fix with `nemoclaw queeg stop && nemoclaw queeg start`, then `ncl` |
+| `binary '/usr/local/bin/node' not allowed in policy 'github'` | Presets are per-program: `github` allows only `git`, `pypi` only curl/python/pip/uv |
+| `pkill -f <pattern>` kills your own shell | The pattern appears in the shell's command line. Use `pkill -f '[o]llama-auth-proxy'` |
 | `pacman -S` 404s on a package | Local db is stale, not the mirror. `sudo pacman -Syu` (a bare `-Sy` + `-S` is a partial upgrade) |
 
 ## Verified on this machine
@@ -561,7 +663,17 @@ Two residual risks worth knowing:
   untrusted party in this design, so this one matters.
 - `memory.search` defaults to the **OpenAI** provider. Inert without a key, but
   on a local-only build set `memory.search.enabled false` so conversation
-  content can never leave the machine.
+  content can never leave the machine. Still unset as of 2026-10-25
+  (`openclaw doctor`: "provider is set to openai but no API key"), so semantic
+  recall is also non-functional.
+
+Egress actually observed in the OCSF logs (2026-10-23 → 25): the only LLM
+endpoint contacted was `host.openshell.internal:11435`. Other traffic was
+tooling — `clawhub.ai`/`catalog.openclaw.ai` (allowed), `telemetry.openclaw.ai`
+(denied), GitHub/PyPI via presets, and research APIs (arXiv, OpenAlex, Semantic
+Scholar, Crossref — denied). Note the provider is configured as
+`models.providers.inference.baseUrl = http://host.openshell.internal:11435/v1`,
+i.e. the agent addresses the proxy directly rather than via `inference.local`.
 
 ## Layout
 
@@ -576,6 +688,9 @@ Outside the repo:
 
 ```
 ~/scripts/start_queeg.sh   one-command startup (see "After a reboot")
+~/.bashrc                  ncl, ncl_mount, ncl_umount, ncl_sh, ncl_stop, ncl_list
+~/.config/systemd/user/nemoclaw-queeg-up.service                    boot proxy attempt (does NOT work, see above)
+~/.config/systemd/user/nemoclaw-openshell-gateway.service.d/wait-dns.conf   boot DNS wait
 ~/nemoclaw-queeg-backup/   pre-rebuild sandbox state - contains credentials,
                            mode 0700, delete when no longer needed
 ```
