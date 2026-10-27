@@ -73,11 +73,21 @@ nemohermes inference set --model deepseek/deepseek-v4-flash \
     --provider openrouter --sandbox prometheus
 ```
 
-| Model | Context | $/M in | $/M out |
-|---|---|---|---|
-| `deepseek/deepseek-v4.1-flash` (current) | 1.05M | 0.14 | 0.42 |
-| `deepseek/deepseek-v4-flash` | 1.05M | 0.14 | 0.28 |
-| `deepseek/deepseek-v4-pro` | 1.05M | 0.955 | 1.911 |
+| Model | Context | $/M in | $/M out | Images |
+|---|---|---|---|---|
+| `deepseek/deepseek-v4.1-flash` (current) | 1.05M | 0.14 | 0.42 | **yes** |
+| `deepseek/deepseek-v4-flash` | 1.05M | 0.14 | 0.28 | **no — text only** |
+| `deepseek/deepseek-v4-pro` | 1.05M | 0.955 | 1.911 | yes |
+
+**Do not switch to `v4-flash` to save $0.14/M on output.** Its
+`input_modalities` is `["text"]` — the saving silently removes image support,
+which the research agent needs for figures and typeset equations. Verify before
+switching:
+
+```bash
+curl -s https://openrouter.ai/api/v1/models \
+  | jq -r '.data[] | select(.id=="<model>") | .architecture.input_modalities'
+```
 
 ---
 
@@ -188,6 +198,37 @@ nemohermes prometheus recover    # restores the port forwards
 | Dashboard hangs on a blank page | `#fragment` changes do not reload. Open a fresh tab |
 | Install fails on build identity | Pin `NEMOCLAW_INSTALL_REF` to a **release tag**, never a commit SHA |
 | Env vars ignored during onboarding | `NEMOCLAW_SANDBOX_NAME` and `NEMOCLAW_WEB_SEARCH_PROVIDER` apply only in non-interactive mode; set them at the prompts |
+
+## The physics research agent
+
+`prometheus` doubles as a physics research collaborator. See
+`workspace/AGENTS.md` for the working rules it follows.
+
+| Piece | Where |
+|---|---|
+| Workspace | `/sandbox/.hermes/workspace` (persistent) |
+| Scientific Python | `…/workspace/.venv/bin/python` — numpy, scipy, sympy, matplotlib, pandas, pint, pymupdf |
+| Pinned versions | `…/workspace/environment.lock` |
+| Custom skills | `physics-derivation`, `physics-numerics`, `physics-report`, `physics-review` |
+| Shipped skills reused | `research/arxiv`, `research/grounded-citations`, `pdf` |
+| Literature egress | arXiv + Crossref via the `physics-research` policy preset |
+
+Source of truth for all of it is this repo: `policy/`, `skills/`, `workspace/`.
+
+### The persistence boundary — read this before storing anything
+
+**Only `/sandbox/.hermes` is on the Docker volume.** Everything else in
+`/sandbox` is the container's ephemeral overlay and is destroyed by
+`rebuild --yes`, which is the only escape from `Phase: Error`. The workspace and
+the research venv both live under `/sandbox/.hermes` for exactly this reason.
+
+### The `binaries:` allowlist — why a new venv has no network
+
+OpenShell policies bind each endpoint to specific executables. The live `pypi`
+policy permits `/opt/hermes/.venv/bin/python` but not a venv elsewhere, so
+`pip install` into a new venv is **denied**, not slow. Any new interpreter must
+be added to a policy's `binaries:` list — see `policy/physics-research.yaml`.
+Verified: `node` is refused an allowed host; the listed venv python is not.
 
 ## Where things live
 
