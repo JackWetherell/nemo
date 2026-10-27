@@ -12,6 +12,95 @@ locally and its notes are in git history.
 
 ---
 
+---
+
+## Daily operation
+
+Three commands cover almost everything. `hermes` is
+`alias hermes='~/scripts/start_hermes.sh'`.
+
+| | Command |
+|---|---|
+| **1. Start** (after login) | `hermes` |
+| **2. Monitor** (while running) | `hermes --status` |
+| **3. Stop** (before reboot/shutdown) | `hermes --backup && hermes --stop` |
+
+### 1. Start — after login
+
+```bash
+hermes
+```
+
+Checks Docker, starts the OpenShell gateway if needed, starts the sandbox,
+**restores both host port forwards**, and opens the TUI.
+
+By hand, if you prefer:
+
+```bash
+nemohermes prometheus start        # requires phase `Stopped`
+nemohermes prometheus recover      # restores forwards on 18789 and 8642
+nemohermes launch prometheus       # TUI
+```
+
+Other ways in, once started:
+
+```bash
+hermes --dashboard                 # prints the browser URL (open in a NEW tab)
+hermes --api                       # prints a ready-to-paste curl for :8642
+hermes --no-launch                 # prepare everything, do not open the TUI
+```
+
+The port forwards **never survive a reboot**. If the dashboard or API refuses to
+connect, that is almost always the cause: `nemohermes prometheus recover`.
+
+### 2. Monitor — while running
+
+```bash
+hermes --status                    # phase, model, provider, policies, both forwards
+```
+
+Deeper, when something looks wrong:
+
+```bash
+nemohermes prometheus status       # full status incl. inference health
+nemohermes prometheus logs --follow    # live logs + OCSF audit events
+nemohermes prometheus doctor       # diagnose; --fix to apply
+openshell sandbox list             # authoritative phase
+ss -ltn | grep -E '18789|8642'     # are the forwards actually up?
+```
+
+What to look for:
+
+| Signal | Healthy |
+|---|---|
+| `Phase` | `Ready` |
+| `Inference` | `healthy (https://openrouter.ai/api/v1/chat/completions)` |
+| Forwards | both `18789` and `8642` listening |
+| Audit log | `denied_action_count=0` (denials are normal if the agent probes a blocked host) |
+
+Spend is not visible locally — check the **OpenRouter dashboard**. Measured cost
+is ~$0.0017 per short turn; research turns with tool use are larger.
+
+### 3. Stop — before reboot or shutdown
+
+```bash
+hermes --backup                    # verified host-side copy of the workspace
+hermes --stop                      # managed stop -> phase `Stopped`
+sudo reboot
+```
+
+**Run both, in that order, every time.** This is not housekeeping — see
+[Reboots](#reboots--read-this-before-you-reboot). Skipping `--stop` latches the
+sandbox at `Error`, whose only recovery is `destroy`, which **deletes the
+volume** holding your workspace, venv and skills. `--backup` is what makes that
+survivable; it refuses to report success unless live and backup file counts
+match.
+
+To stop without rebooting, `hermes --stop` alone is enough. Restart later with
+`hermes`.
+
+---
+
 ## The stack
 
 | Layer | Version | Role |
@@ -115,20 +204,19 @@ Any OpenAI-compatible client can point at `http://127.0.0.1:8642/v1`.
 Dashboard: `http://127.0.0.1:18789/` — **open it in a new tab**; changing only a
 URL `#fragment` does not reload the page, so the token is never read.
 
-### Lifecycle
+### Less common lifecycle commands
+
+Start, monitor and stop are covered in [Daily operation](#daily-operation).
+The rest:
 
 ```bash
-nemohermes prometheus status              # phase, route, policies
-nemohermes prometheus recover             # repair gateway + restore port forwards
-nemohermes prometheus logs --follow
-nemohermes prometheus doctor              # --fix to apply
-nemohermes prometheus stop | start
-nemohermes prometheus rebuild --yes       # only escape from Phase: Error
-nemohermes list
+nemohermes list                           # all sandboxes
+nemohermes prometheus rebuild             # upgrade the agent version (interactive)
+nemohermes prometheus skill list          # installed skills
+nemohermes prometheus policy list         # applied egress presets
+nemohermes prometheus sessions list       # conversation sessions
+nemohermes prometheus sessions reset <k>  # clear a session that has grown unwieldy
 ```
-
-**Both ports need a host forward**, and they do not survive a restart.
-`recover` restores them — that is what the startup script does first.
 
 ### Files in and out
 
@@ -203,30 +291,51 @@ nemohermes prometheus recover     # restores forwards on 18789 and 8642
 
 ### If you rebooted without stopping first
 
-The container is SIGTERMed by the shutdown sequence (`exit 143`) and, because it
-vanished rather than stopping through a managed call, OpenShell latches the
-sandbox at `Error`. Every non-destructive repair fails — all four were tried:
+This is the expensive path. Verified, the hard way:
+
+The container is SIGTERMed by shutdown (`exit 143`); because it vanished rather
+than stopping through a managed call, OpenShell latches the sandbox at `Error`.
+**Every recovery fails, including rebuild:**
 
 | Attempt | Result |
 |---|---|
-| `nemohermes <name> start` | Refused — `start` requires `Stopped` |
-| `nemohermes <name> recover` | Fails — needs the container running |
-| `docker start <container>` | Container runs, **phase stays `Error`** |
-| `systemctl --user restart nemoclaw-openshell-gateway` | **Phase stays `Error`** |
+| `start` | Refused — requires phase `Stopped` |
+| `recover` | Fails — needs the container running |
+| `docker start <container>` | Container runs fine, **phase stays `Error`** |
+| `systemctl --user restart …gateway` | **Phase stays `Error`** |
+| `rebuild` / `rebuild --force` | **`Sandbox is unreachable`** — rebuild must reach the sandbox to back it up, and it cannot |
+| `openshell sandbox delete` → re-onboard | **The only thing that works** |
 
-The `Error` phase lives in the gateway's state store, not the container, and
-survives both. Only this clears it:
+The sandbox stays *functionally alive* throughout — supervisor, Hermes gateway
+and dashboard all running inside the container. It is purely the gateway's phase
+record that is stuck, and no command re-syncs it.
+
+**`destroy` removes the managed state volume.** So the only available recovery
+is also the one that deletes `workspace/`, the venv and your skills.
+
+### Back up before you reboot
+
+Because of the above, the volume is *not* a safe home for anything you cannot
+regenerate. `/sandbox/.hermes` survives `rebuild` but **not `destroy`**, and an
+unclean reboot forces `destroy`.
 
 ```bash
-nemohermes prometheus rebuild     # interactive - it preflights credentials
+~/scripts/start_hermes.sh --backup     # host-side copy of the workspace
+~/scripts/start_hermes.sh --stop       # then stop cleanly
+sudo reboot
 ```
 
-Use the interactive form. `--yes` aborts at preflight if a channel credential
-(e.g. `TAVILY_API_KEY`) is not available non-interactively — safely, leaving the
-sandbox untouched, but you still have to supply the key.
+To restore into a fresh sandbox:
 
-A rebuild preserves everything on the volume (`workspace/`, the research venv,
-skills, `config.yaml`) and resets `gateway.auth` plus the secret store.
+```bash
+CID=$(docker ps -q --filter name=prometheus)
+docker cp ~/hermes-workspace-backup-<stamp>/workspace/. "$CID:/sandbox/.hermes/workspace/"
+docker exec "$CID" chown -R sandbox:sandbox /sandbox/.hermes/workspace
+```
+
+The venv survives this round-trip intact — verified. Everything else needed to
+rebuild the agent (policy, skills, AGENTS.md) is version-controlled in this repo,
+so a full recovery is roughly five minutes.
 
 ## Troubleshooting
 
@@ -259,9 +368,13 @@ Source of truth for all of it is this repo: `policy/`, `skills/`, `workspace/`.
 ### The persistence boundary — read this before storing anything
 
 **Only `/sandbox/.hermes` is on the Docker volume.** Everything else in
-`/sandbox` is the container's ephemeral overlay and is destroyed by
-`rebuild --yes`, which is the only escape from `Phase: Error`. The workspace and
-the research venv both live under `/sandbox/.hermes` for exactly this reason.
+`/sandbox` is the container's ephemeral overlay, so the workspace and research
+venv live under `/sandbox/.hermes`.
+
+That protects them from `rebuild` — **but not from `destroy`, which removes the
+volume.** Since an unclean reboot can only be recovered by `destroy`, treat the
+volume as durable against upgrades and *not* against accidents. Take host-side
+backups (`start_hermes.sh --backup`).
 
 ### The `binaries:` allowlist — why a new venv has no network
 
