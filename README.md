@@ -165,27 +165,68 @@ internet; it does not make a remote model local.
 
 ---
 
-## After a reboot
+## Reboots — read this before you reboot
 
-`Linger=yes` is set, so the OpenShell gateway starts at boot without a login.
+**A plain `sudo reboot` leaves the sandbox permanently in `Phase: Error`, and
+the only exit is a rebuild.** This is verified behaviour, not a theory. Shut the
+sandbox down cleanly first and the problem does not arise.
+
+### Before rebooting
+
+```bash
+nemohermes prometheus stop        # managed stop -> lands in `Stopped`, not `Error`
+sudo reboot
+```
+
+### After booting
+
+```bash
+~/scripts/start_hermes.sh         # alias: hermes
+```
+
+The script starts the gateway if needed, starts the sandbox, and runs `recover`
+to restore the two host forwards — which never survive a reboot.
+
+By hand:
+
+```bash
+nemohermes prometheus start       # requires phase `Stopped`
+nemohermes prometheus recover     # restores forwards on 18789 and 8642
+```
+
+### What survives a reboot
 
 | Comes back automatically | Does not |
 |---|---|
-| Docker (data-root `/home/docker`) | The sandbox container (restart policy `no`) |
-| OpenShell gateway (user unit + linger) | Host forwards on `18789` and `8642` |
+| Docker (data-root `/home/docker`) | The sandbox container — restart policy is `no` |
+| OpenShell gateway (user unit, `Linger=yes`, so no login needed) | Host forwards on `18789` and `8642` |
+
+### If you rebooted without stopping first
+
+The container is SIGTERMed by the shutdown sequence (`exit 143`) and, because it
+vanished rather than stopping through a managed call, OpenShell latches the
+sandbox at `Error`. Every non-destructive repair fails — all four were tried:
+
+| Attempt | Result |
+|---|---|
+| `nemohermes <name> start` | Refused — `start` requires `Stopped` |
+| `nemohermes <name> recover` | Fails — needs the container running |
+| `docker start <container>` | Container runs, **phase stays `Error`** |
+| `systemctl --user restart nemoclaw-openshell-gateway` | **Phase stays `Error`** |
+
+The `Error` phase lives in the gateway's state store, not the container, and
+survives both. Only this clears it:
 
 ```bash
-~/scripts/start_hermes.sh      # handles both; alias it to `hermes`
+nemohermes prometheus rebuild     # interactive - it preflights credentials
 ```
 
-Or by hand:
+Use the interactive form. `--yes` aborts at preflight if a channel credential
+(e.g. `TAVILY_API_KEY`) is not available non-interactively — safely, leaving the
+sandbox untouched, but you still have to supply the key.
 
-```bash
-nemohermes prometheus start
-nemohermes prometheus recover    # restores the port forwards
-```
-
----
+A rebuild preserves everything on the volume (`workspace/`, the research venv,
+skills, `config.yaml`) and resets `gateway.auth` plus the secret store.
 
 ## Troubleshooting
 
