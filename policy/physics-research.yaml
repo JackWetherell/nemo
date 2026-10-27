@@ -1,0 +1,71 @@
+# Physics research egress preset.
+#
+# Why this exists rather than reusing shipped presets:
+#   1. The live `pypi` policy (Hermes-adapted) permits /opt/hermes/.venv/bin/python
+#      but not a venv on the persistent volume, so pip there would be DENIED.
+#   2. `public-reference` covers Wikipedia/Wikidata/OSM - not arXiv or Crossref.
+#
+# binaries: is the per-program allowlist. An interpreter absent from it has no
+# network at all, whatever the endpoints permit.
+
+preset:
+  name: physics-research
+  description: "arXiv, Crossref and PyPI access for the physics research venv"
+
+network_policies:
+  physics_research:
+    name: physics_research
+    endpoints:
+      # --- Python packages, for the research venv on the volume ---
+      - host: pypi.org
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: GET, path: "/**" }
+          - allow: { method: HEAD, path: "/**" }
+      - host: files.pythonhosted.org
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: GET, path: "/**" }
+          - allow: { method: HEAD, path: "/**" }
+      # --- arXiv metadata API (<=1 request / 3 s, single connection) ---
+      - host: export.arxiv.org
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: GET, path: "/api/**" }
+          - allow: { method: HEAD, path: "/api/**" }
+      # --- arXiv abstracts, PDFs and TeX source ---
+      - host: arxiv.org
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: GET, path: "/abs/**" }
+          - allow: { method: GET, path: "/pdf/**" }
+          - allow: { method: GET, path: "/e-print/**" }
+          - allow: { method: GET, path: "/list/**" }
+          - allow: { method: HEAD, path: "/**" }
+      # --- Crossref DOI metadata ---
+      - host: api.crossref.org
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          # /works/** matches DOI lookups; bare /works is the search
+          # endpoint (GET /works?query=...) and needs its own rule.
+          - allow: { method: GET, path: "/**" }
+          - allow: { method: HEAD, path: "/**" }
+    binaries:
+      - { path: /sandbox/.hermes/workspace/.venv/bin/python* }
+      - { path: /sandbox/.hermes/workspace/.venv/bin/pip* }
+      - { path: /usr/bin/python3* }
+      - { path: /usr/bin/pip* }
+      - { path: /usr/local/bin/python3* }
+      - { path: /usr/local/bin/pip* }
+      - { path: /usr/bin/curl }
+      - { path: /usr/local/bin/curl }
